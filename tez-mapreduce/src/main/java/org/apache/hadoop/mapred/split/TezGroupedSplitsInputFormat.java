@@ -1,0 +1,204 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.hadoop.mapred.split;
+
+import java.io.IOException;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configurable;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapred.InputFormat;
+import org.apache.hadoop.mapred.InputSplit;
+import org.apache.hadoop.mapred.JobConf;
+import org.apache.hadoop.mapred.RecordReader;
+import org.apache.hadoop.mapred.Reporter;
+import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.tez.dag.api.TezUncheckedException;
+
+import com.google.common.base.Preconditions;
+
+public class TezGroupedSplitsInputFormat<K, V> 
+  implements InputFormat<K, V>, Configurable{
+  
+  private static final Log LOG = LogFactory.getLog(TezGroupedSplitsInputFormat.class);
+
+  InputFormat<K, V> wrappedInputFormat;
+  int desiredNumSplits = 0;
+  Configuration conf;
+  
+  public TezGroupedSplitsInputFormat() {
+    
+  }
+  
+  public void setInputFormat(InputFormat<K, V> wrappedInputFormat) {
+    this.wrappedInputFormat = wrappedInputFormat;
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("wrappedInputFormat: " + wrappedInputFormat.getClass().getName());
+    }
+  }
+  
+  public void setDesiredNumberOfSplits(int num) {
+    Preconditions.checkArgument(num >= 0);
+    this.desiredNumSplits = num;
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("desiredNumSplits: " + desiredNumSplits);
+    }
+  }
+  
+  @Override
+  public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+    InputSplit[] originalSplits = wrappedInputFormat.getSplits(job, numSplits);
+    TezMapredSplitsGrouper grouper = new TezMapredSplitsGrouper();
+    String wrappedInputFormatName = wrappedInputFormat.getClass().getName();
+    return grouper.getGroupedSplits(conf, originalSplits, desiredNumSplits, wrappedInputFormatName);
+  }
+  
+  @Override
+  public RecordReader<K, V> getRecordReader(InputSplit split, JobConf job,
+      Reporter reporter) throws IOException {
+    TezGroupedSplit groupedSplit = (TezGroupedSplit) split;
+    initInputFormatFromSplit(groupedSplit);
+    return new TezGroupedSplitsRecordReader(groupedSplit, job, reporter);
+  }
+  
+  @SuppressWarnings({ "unchecked", "rawtypes" })
+  void initInputFormatFromSplit(TezGroupedSplit split) {
+    if (wrappedInputFormat == null) {
+      Class<? extends InputFormat> clazz = (Class<? extends InputFormat>) 
+          getClassFromName(split.wrappedInputFormatName);
+      try {
+        wrappedInputFormat = ReflectionUtils.newInstance(clazz, conf);
+      } catch (Exception e) {
+        throw new TezUncheckedException(e);
+      }
+    }
+  }
+  
+  static Class<?> getClassFromName(String name) {
+    try {
+      return Class.forName(name);
+    } catch (ClassNotFoundException e1) {
+      throw new TezUncheckedException(e1);
+    }
+  }
+  
+  public class TezGroupedSplitsRecordReader implements RecordReader<K, V> {
+
+    TezGroupedSplit groupedSplit;
+    JobConf job;
+    Reporter reporter;
+    int idx = 0;
+    long progress;
+    RecordReader<K, V> curReader;
+    
+    public TezGroupedSplitsRecordReader(TezGroupedSplit split, JobConf job,
+        Reporter reporter) throws IOException {
+      this.groupedSplit = split;
+      this.job = job;
+      this.reporter = reporter;
+      initNextRecordReader();
+    }
+    
+    @Override
+    public boolean next(K key, V value) throws IOException {
+
+      while ((curReader == null) || !curReader.next(key, value)) {
+        if (!initNextRecordReader()) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public K createKey() {
+      return curReader.createKey();
+    }
+    
+    @Override
+    public V createValue() {
+      return curReader.createValue();
+    }
+    
+    @Override
+    public float getProgress() throws IOException {
+      return Math.min(1.0f,  getPos()/(float)(groupedSplit.getLength()));
+    }
+    
+    @Override
+    public void close() throws IOException {
+      if (curReader != null) {
+        curReader.close();
+        curReader = null;
+      }
+    }
+    
+    protected boolean initNextRecordReader() throws IOException {
+      if (curReader != null) {
+        curReader.close();
+        curReader = null;
+        if (idx > 0) {
+          progress += groupedSplit.wrappedSplits.get(idx-1).getLength();
+        }
+      }
+
+      // if all chunks have been processed, nothing more to do.
+      if (idx == groupedSplit.wrappedSplits.size()) {
+        return false;
+      }
+
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Init record reader for index " + idx + " of " + 
+                  groupedSplit.wrappedSplits.size());
+      }
+
+      // get a record reader for the idx-th chunk
+      try {
+        curReader = wrappedInputFormat.getRecordReader(
+            groupedSplit.wrappedSplits.get(idx), job, reporter);
+      } catch (Exception e) {
+        throw new RuntimeException (e);
+      }
+      idx++;
+      return true;
+    }
+
+    @Override
+    public long getPos() throws IOException {
+      long subprogress = 0;    // bytes processed in current split
+      if (null != curReader) {
+        // idx is always one past the current subsplit's true index.
+        subprogress = curReader.getPos();
+      }
+      return (progress + subprogress);
+    }
+  }
+
+  @Override
+  public void setConf(Configuration conf) {
+    this.conf = conf;
+  }
+
+  @Override
+  public Configuration getConf() {
+    return conf;
+  }
+
+}
